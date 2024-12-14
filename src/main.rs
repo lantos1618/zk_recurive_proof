@@ -1,389 +1,354 @@
+use anyhow::Result;
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField as F,
-        types::{Field, PrimeField64},
-    }, hash::hash_types::{HashOutTarget, MerkleCapTarget}, iop::{
-        generator::{GeneratedValues, SimpleGenerator},
+        types::Field,
+    },
+    iop::{
+        witness::{PartialWitness, WitnessWrite},
         target::Target,
-        witness::{PartialWitness, PartitionWitness, WitnessWrite},
-    }, plonk::{
+    },
+    plonk::{
         circuit_builder::CircuitBuilder,
-        circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData},
+        circuit_data::CircuitConfig,
         config::PoseidonGoldilocksConfig,
-        proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
-    }, recursion::cyclic_recursion::check_cyclic_proof_verifier_data, util::serialization::{Buffer, IoResult, Read, Write}
+    },
 };
-
-use anyhow::Result;
 
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 
-/// A simplified 2048 circuit. In a real implementation, add proper move constraints.
+/// Represents a move direction in the 2048 game
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    Up = 0,
+    Down = 1,
+    Left = 2,
+    Right = 3,
+}
+
+/// Circuit for verifying moves in the 2048 game
 #[derive(Debug)]
-struct Game2048Circuit;
+struct Game2048Circuit {
+    config: CircuitConfig,
+    board_size: usize,
+}
 
 impl Game2048Circuit {
-    /// Builds a base circuit for verifying a single move in the 2048 game.
-    /// Returns (builder, targets) where targets are:
-    ///  - 16 before-board targets
-    ///  - 16 after-board targets
-    ///  - 1 direction target
-    pub fn build_circuit() -> (CircuitBuilder<F, D>, Vec<Target>) {
+    /// Creates a new 2048 game circuit
+    pub fn new(board_size: usize) -> Self {
         let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
+        Self {
+            config,
+            board_size,
+        }
+    }
 
-        // 16 before + 16 after + 1 direction = 33 total public inputs
+    /// Builds a circuit for verifying a single move
+    /// Returns (circuit_builder, input_targets) where input_targets contains:
+    /// - board_size^2 targets for the before board state
+    /// - board_size^2 targets for the after board state
+    /// - 1 target for move direction
+    pub fn build_circuit(&self) -> (CircuitBuilder<F, D>, Vec<Target>) {
+        let mut builder = CircuitBuilder::<F, D>::new(self.config.clone());
+        let total_cells = self.board_size * self.board_size;
+
+        // Create targets for before and after board states
         let mut targets = vec![];
-        for _ in 0..16 {
+        
+        // Before board state
+        for _ in 0..total_cells {
             let t = builder.add_virtual_target();
             builder.register_public_input(t);
             targets.push(t);
         }
-        for _ in 0..16 {
+
+        // After board state
+        for _ in 0..total_cells {
             let t = builder.add_virtual_target();
             builder.register_public_input(t);
             targets.push(t);
         }
+
+        // Direction target
         let direction_t = builder.add_virtual_target();
         builder.register_public_input(direction_t);
         targets.push(direction_t);
 
-        // Add constraints for a valid move
-        Self::add_constraints(&mut builder, &targets[0..16], &targets[16..32], targets[32]);
+        // Add constraints
+        self.add_move_constraints(&mut builder, &targets);
 
         builder.print_gate_counts(0);
         (builder, targets)
     }
 
-    /// Add constraints to ensure the move from before_board to after_board is valid.
-    /// For simplicity, we won't implement full 2048 rules here—just placeholder constraints.
-    pub fn add_constraints(
+    /// Adds constraints to verify a valid move
+    fn add_move_constraints(&self, builder: &mut CircuitBuilder<F, D>, targets: &[Target]) {
+        let total_cells = self.board_size * self.board_size;
+        let (before_board, after_board) = targets.split_at(total_cells);
+        let (after_board, direction) = after_board.split_at(total_cells);
+        let direction = direction[0];
+
+        // Range check all board values (assuming max value is 2^11 = 2048)
+        for &t in before_board.iter().chain(after_board.iter()) {
+            builder.range_check(t, 11);
+        }
+
+        // Range check direction (0-3)
+        builder.range_check(direction, 2);
+
+        // Core game rules constraints
+        self.add_game_rules_constraints(builder, before_board, after_board, direction);
+    }
+
+    /// Adds constraints for the core 2048 game rules
+    fn add_game_rules_constraints(
+        &self,
         builder: &mut CircuitBuilder<F, D>,
         before_board: &[Target],
         after_board: &[Target],
         direction: Target,
     ) {
-        // Add range checks for all inputs
-        for &t in before_board.iter().chain(after_board.iter()) {
-            builder.range_check(t, 32);  // Assuming values are 32-bit
-        }
-        builder.range_check(direction, 2);  // 0-3 for directions
-
-        // Placeholder constraints: sum(before_board) = sum(after_board)
-        let mut before_sum = builder.zero();
+        // 1. Conservation of tiles constraint
+        let zero = builder.constant(F::ZERO);
+        let mut before_sum = zero;
         for &b in before_board {
             before_sum = builder.add(before_sum, b);
         }
-        let mut after_sum = builder.zero();
+        let mut after_sum = zero;
         for &a in after_board {
             after_sum = builder.add(after_sum, a);
         }
-        builder.connect(before_sum, after_sum);
-    }
-}
+        // After sum must be >= before sum
+        let diff = builder.sub(after_sum, before_sum);
+        builder.range_check(diff, 11); // Difference must be <= 2048
 
-/// Recursive circuit that can verify a previous proof and a current move.
-#[derive(Debug)]
-struct RecursiveGame2048Circuit {
-    circuit: CircuitData<F, C, D>,
-    recursive_proof_target: ProofWithPublicInputsTarget<D>,
-    before_board_targets: Vec<Target>,
-    after_board_targets: Vec<Target>,
-    direction_target: Target,
-    num_moves_target: Target, // Track number of moves in the recursion
-}
-
-impl RecursiveGame2048Circuit {
-    pub fn build_recursive_circuit() -> Self {
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
-
-        // Add recursive proof target that points to the same circuit type
-        let recursive_proof_target = builder.add_virtual_proof_with_pis(&builder.common_data());
-        let verifier_data = builder.add_virtual_verifier_data(builder.common_data().config.fri_config.cap_height);
-        
-        // Add generator for verifier data
-        builder.add_simple_generator(VerifierDataGenerator {
-            verifier_data_target: verifier_data.clone(),
-            verifier_data: builder.common_data().verifier_only.clone(),
-        });
-
-        // Current move inputs
-        let before_board_targets: Vec<_> = (0..16).map(|_| builder.add_virtual_target()).collect();
-        let after_board_targets: Vec<_> = (0..16).map(|_| builder.add_virtual_target()).collect();
-        let direction_target = builder.add_virtual_target();
-        let num_moves_target = builder.add_virtual_target();
-
-        // Register all public inputs
-        for &t in &before_board_targets {
-            builder.register_public_input(t);
-        }
-        for &t in &after_board_targets {
-            builder.register_public_input(t);
-        }
-        builder.register_public_input(direction_target);
-        builder.register_public_input(num_moves_target);
-
-        // Verify previous proof only if num_moves > 0
-        let zero = builder.zero();
-        let is_base_case = builder.is_equal(num_moves_target, zero);
-        let not_base_case = builder.not(is_base_case);
-        
-        // Conditionally verify the recursive proof
-        builder.verify_proof_with_bool::<C>(
-            &recursive_proof_target,
-            &verifier_data,
-            &builder.common_data(),
-            not_base_case
-        );
-
-        // Add constraints for current move
-        Game2048Circuit::add_constraints(
-            &mut builder,
-            &before_board_targets,
-            &after_board_targets,
-            direction_target,
-        );
-
-        // Connect the after_board of previous proof to before_board of current proof when not in base case
-        for (prev_after, curr_before) in recursive_proof_target.public_inputs[16..32]
-            .iter()
-            .zip(before_board_targets.iter()) {
-            let connected = builder.select(not_base_case, *prev_after, *curr_before);
-            builder.connect(*curr_before, connected);
+        // 2. Value constraints
+        // All values must be powers of 2 or 0
+        for &cell in before_board.iter().chain(after_board.iter()) {
+            self.add_power_of_two_constraint(builder, cell);
         }
 
-        builder.print_gate_counts(0);
-        let circuit = builder.build::<C>();
-
-        Self {
-            circuit,
-            recursive_proof_target,
-            before_board_targets,
-            after_board_targets,
-            direction_target,
-            num_moves_target,
-        }
+        // 3. Direction-specific constraints
+        self.add_direction_constraints(builder, before_board, after_board, direction);
     }
 
-    pub fn prove(
+    /// Adds direction-specific constraints for the move
+    fn add_direction_constraints(
         &self,
-        moves: Vec<(Vec<F>, Vec<F>, F)>, // List of (before_board, after_board, direction)
-    ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-        if moves.is_empty() {
-            anyhow::bail!("No moves provided");
+        builder: &mut CircuitBuilder<F, D>,
+        before_board: &[Target],
+        after_board: &[Target],
+        direction: Target,
+    ) {
+        // Create constants for each direction
+        let up = builder.constant(F::from_canonical_u32(Direction::Up as u32));
+        let down = builder.constant(F::from_canonical_u32(Direction::Down as u32));
+        let left = builder.constant(F::from_canonical_u32(Direction::Left as u32));
+        let right = builder.constant(F::from_canonical_u32(Direction::Right as u32));
+
+        // Check if each direction is selected
+        let is_up = builder.is_equal(direction, up);
+        let is_down = builder.is_equal(direction, down);
+        let is_left = builder.is_equal(direction, left);
+        let is_right = builder.is_equal(direction, right);
+
+        // Create constant targets for 0 and 1
+        let zero_target = builder.constant(F::ZERO);
+        let one_target = builder.constant(F::ONE);
+
+        // For each row/column, add constraints based on the direction
+        for row in 0..self.board_size {
+            for col in 0..self.board_size {
+                let idx = row * self.board_size + col;
+                let current = before_board[idx];
+                let current_after = after_board[idx];
+                
+                // Basic cell transition constraints
+                let stays_same = builder.is_equal(current, current_after);
+                let becomes_zero = builder.is_equal(current_after, zero_target);
+
+                // For each cell, we need to check if it can merge with neighbors
+                let mut can_merge = Vec::new();
+                
+                // Check up
+                if row > 0 {
+                    let up_idx = (row - 1) * self.board_size + col;
+                    let up_val = before_board[up_idx];
+                    let up_after = after_board[up_idx];
+                    let values_equal = builder.is_equal(current, up_val);
+                    let merged_value = builder.mul_const(F::TWO, current);
+                    let merged_correctly = builder.is_equal(up_after, merged_value);
+                    let merge_happened = builder.and(values_equal, merged_correctly);
+                    can_merge.push(builder.and(merge_happened, is_up));
+                }
+
+                // Check down
+                if row < self.board_size - 1 {
+                    let down_idx = (row + 1) * self.board_size + col;
+                    let down_val = before_board[down_idx];
+                    let down_after = after_board[down_idx];
+                    let values_equal = builder.is_equal(current, down_val);
+                    let merged_value = builder.mul_const(F::TWO, current);
+                    let merged_correctly = builder.is_equal(down_after, merged_value);
+                    let merge_happened = builder.and(values_equal, merged_correctly);
+                    can_merge.push(builder.and(merge_happened, is_down));
+                }
+
+                // Check left
+                if col > 0 {
+                    let left_idx = row * self.board_size + (col - 1);
+                    let left_val = before_board[left_idx];
+                    let left_after = after_board[left_idx];
+                    let values_equal = builder.is_equal(current, left_val);
+                    let merged_value = builder.mul_const(F::TWO, current);
+                    let merged_correctly = builder.is_equal(left_after, merged_value);
+                    let merge_happened = builder.and(values_equal, merged_correctly);
+                    can_merge.push(builder.and(merge_happened, is_left));
+                }
+
+                // Check right
+                if col < self.board_size - 1 {
+                    let right_idx = row * self.board_size + (col + 1);
+                    let right_val = before_board[right_idx];
+                    let right_after = after_board[right_idx];
+                    let values_equal = builder.is_equal(current, right_val);
+                    let merged_value = builder.mul_const(F::TWO, current);
+                    let merged_correctly = builder.is_equal(right_after, merged_value);
+                    let merge_happened = builder.and(values_equal, merged_correctly);
+                    can_merge.push(builder.and(merge_happened, is_right));
+                }
+
+                // A cell must either:
+                // 1. Stay the same (if no movement possible in chosen direction)
+                // 2. Become zero (if moved or merged)
+                // 3. Double in value (if merged with equal value)
+                let any_merge_possible = if can_merge.is_empty() {
+                    zero_target
+                } else {
+                    // Convert boolean targets to field targets first
+                    let merge_targets: Vec<_> = can_merge.iter()
+                        .map(|&b| builder.select(b, one_target, zero_target))
+                        .collect();
+                    
+                    // Then sum them up
+                    let merge_sum = builder.add_many(&merge_targets);
+                    
+                    // Finally check if exactly one merge happened
+                    let is_one_merge = builder.is_equal(merge_sum, one_target);
+                    builder.select(is_one_merge, one_target, zero_target)
+                };
+
+                // The cell's final state must be valid
+                let stays_same_target = builder.select(stays_same, one_target, zero_target);
+                let becomes_zero_target = builder.select(becomes_zero, one_target, zero_target);
+                
+                let valid_state = [
+                    stays_same_target,
+                    becomes_zero_target,
+                    any_merge_possible,
+                ];
+                let state_sum = builder.add_many(&valid_state);
+                builder.connect(state_sum, one_target);
+            }
         }
 
-        let mut current_proof = None;
-        let mut num_moves = moves.len();
-
-        // Process moves in reverse order to build up the recursive proofs
-        for (before_board, after_board, direction) in moves.iter().rev() {
-            // Validate input sizes
-            if before_board.len() != 16 {
-                anyhow::bail!("Before board must have exactly 16 elements");
-            }
-            if after_board.len() != 16 {
-                anyhow::bail!("After board must have exactly 16 elements");
-            }
-            
-            // Validate direction
-            let dir_val = direction.to_canonical_u64();
-            if dir_val > 3 {
-                anyhow::bail!("Direction must be 0 (up), 1 (down), 2 (left), or 3 (right)");
-            }
-
-            let mut pw = PartialWitness::<F>::new();
-
-            // Set previous proof witness if any
-            if let Some(proof) = current_proof {
-                pw.set_proof_with_pis_target(&self.recursive_proof_target, &proof)?;
-            }
-
-            // Set current move
-            for (i, &target) in self.before_board_targets.iter().enumerate() {
-                pw.set_target(target, before_board[i])?;
-            }
-            for (i, &target) in self.after_board_targets.iter().enumerate() {
-                pw.set_target(target, after_board[i])?;
-            }
-            pw.set_target(self.direction_target, *direction)?;
-            pw.set_target(self.num_moves_target, F::from_canonical_u64(num_moves as u64))?;
-
-            // Generate proof for this step
-            current_proof = Some(self.circuit.prove(pw)?);
-            num_moves -= 1;
-        }
-
-        current_proof.ok_or_else(|| anyhow::anyhow!("Failed to generate proof"))
+        // Verify that exactly one direction is chosen
+        let up_target = builder.select(is_up, one_target, zero_target);
+        let down_target = builder.select(is_down, one_target, zero_target);
+        let left_target = builder.select(is_left, one_target, zero_target);
+        let right_target = builder.select(is_right, one_target, zero_target);
+        
+        let direction_targets = [up_target, down_target, left_target, right_target];
+        let sum = builder.add_many(&direction_targets);
+        builder.connect(sum, one_target);
     }
 
-    pub fn verify(
+    /// Adds constraint that a value must be 0 or a power of 2
+    fn add_power_of_two_constraint(&self, builder: &mut CircuitBuilder<F, D>, value: Target) {
+        // Create constant targets for 0 and 1
+        let zero_target = builder.constant(F::ZERO);
+        let one_target = builder.constant(F::ONE);
+
+        // Create a list of valid values: 0, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+        let valid_values: Vec<Target> = (0..12)
+            .map(|i| {
+                if i == 0 {
+                    builder.constant(F::ZERO)
+                } else {
+                    builder.constant(F::from_canonical_u32(1 << i))
+                }
+            })
+            .collect();
+
+        // Add constraint that value must equal one of these
+        let mut valid_value_targets = Vec::new();
+        for &valid_value in &valid_values {
+            let is_this_value = builder.is_equal(value, valid_value);
+            valid_value_targets.push(builder.select(is_this_value, one_target, zero_target));
+        }
+        let sum = builder.add_many(&valid_value_targets);
+        builder.connect(sum, one_target);
+    }
+
+    /// Proves a valid move
+    pub fn prove_move(
         &self,
-        proof: ProofWithPublicInputs<F, C, D>,
-    ) -> anyhow::Result<()> {
-        // Validate public inputs length
-        let expected_inputs = 34; // 16 before + 16 after + 1 direction + 1 num_moves
-        if proof.public_inputs.len() != expected_inputs {
-            anyhow::bail!(
-                "Invalid number of public inputs. Expected {}, got {}",
-                expected_inputs,
-                proof.public_inputs.len()
-            );
+        before_board: Vec<F>,
+        after_board: Vec<F>,
+        direction: Direction,
+    ) -> Result<()> {
+        let (builder, targets) = self.build_circuit();
+        let total_cells = self.board_size * self.board_size;
+
+        let mut pw = PartialWitness::new();
+
+        // Set before board values
+        for (i, &value) in before_board.iter().enumerate() {
+            pw.set_target(targets[i], value)?;
         }
 
-        // Validate direction value
-        let direction = proof.public_inputs[32].to_canonical_u64();
-        if direction > 3 {
-            anyhow::bail!("Invalid direction value in proof: {}", direction);
+        // Set after board values
+        for (i, &value) in after_board.iter().enumerate() {
+            pw.set_target(targets[total_cells + i], value)?;
         }
 
-        // Validate num_moves value
-        let num_moves = proof.public_inputs[33].to_canonical_u64();
-        if num_moves == 0 {
-            anyhow::bail!("Invalid number of moves: {}", num_moves);
-        }
+        // Set direction
+        pw.set_target(targets[2 * total_cells], F::from_canonical_u32(direction as u32))?;
 
-        // First verify the proof itself
-        self.circuit.verify(proof.clone())?;
+        let data = builder.build::<C>();
+        let proof = data.prove(pw)?;
 
-        // Then verify the cyclic proof verifier data
-        check_cyclic_proof_verifier_data(&proof, &self.circuit.verifier_only, &self.circuit.common)
-    }
-}
+        // Verify the proof
+        data.verify(proof)?;
+        println!("Move verified successfully!");
 
-#[derive(Debug)]
-struct VerifierDataGenerator {
-    verifier_data_target: VerifierCircuitTarget,
-    verifier_data: VerifierOnlyCircuitData<C, D>,
-}
-
-impl SimpleGenerator<F, D> for VerifierDataGenerator {
-    fn id(&self) -> String {
-        "VerifierDataGenerator".to_string()
-    }
-
-    fn dependencies(&self) -> Vec<Target> {
-        vec![]
-    }
-
-    fn run_once(&self, _witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> anyhow::Result<()> {
-        out_buffer.set_verifier_data_target(&self.verifier_data_target, &self.verifier_data);
         Ok(())
     }
-
-    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
-        // Serialize the verifier data target
-        let cap_targets = &self.verifier_data_target.constants_sigmas_cap.0;
-        dst.write_usize(cap_targets.len())?;
-        for hash_out in cap_targets {
-            for &element in &hash_out.elements {
-                dst.write_target(element)?;
-            }
-        }
-
-        // Serialize circuit digest
-        for &element in &self.verifier_data_target.circuit_digest.elements {
-            dst.write_target(element)?;
-        }
-        
-        // Serialize verifier data
-        let verifier_bytes = self.verifier_data.to_bytes()?;
-        dst.write_usize(verifier_bytes.len())?;
-        dst.extend_from_slice(&verifier_bytes);
-        Ok(())
-    }
-
-    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
-        // Deserialize MerkleCapTarget
-        let cap_len = src.read_usize()?;
-        let mut cap_targets = Vec::with_capacity(cap_len);
-        for _ in 0..cap_len {
-            let mut elements = [Target::default(); 4];
-            for element in &mut elements {
-                *element = src.read_target()?;
-            }
-            cap_targets.push(HashOutTarget { elements });
-        }
-        let constants_sigmas_cap = MerkleCapTarget(cap_targets);
-
-        // Deserialize HashOutTarget
-        let mut elements = [Target::default(); 4];
-        for element in &mut elements {
-            *element = src.read_target()?;
-        }
-        let circuit_digest = HashOutTarget { elements };
-
-        // Create VerifierCircuitTarget
-        let verifier_data_target = VerifierCircuitTarget {
-            constants_sigmas_cap,
-            circuit_digest,
-        };
-
-        // Deserialize VerifierOnlyCircuitData
-        let data_len = src.read_usize()?;
-        let mut data_bytes = vec![0u8; data_len];
-        src.read_exact(&mut data_bytes)?;
-        let verifier_data = VerifierOnlyCircuitData::from_bytes(data_bytes)?;
-
-        Ok(Self {
-            verifier_data_target,
-            verifier_data,
-        })
-    }
 }
 
-/// Main function demonstrating the 2048 game circuit proof generation and verification
 fn main() -> Result<()> {
-    // Input boards and direction
-    let before_board: Vec<F> = vec![
+    // Example usage
+    let circuit = Game2048Circuit::new(4); // 4x4 board
+
+    // Example board state before move
+    let before_board = vec![
         F::from_canonical_u32(2), F::from_canonical_u32(2), F::from_canonical_u32(4), F::from_canonical_u32(8),
-        F::from_canonical_u32(2), F::ZERO,                  F::from_canonical_u32(4), F::from_canonical_u32(4),
+        F::ZERO, F::ZERO, F::from_canonical_u32(4), F::from_canonical_u32(4),
         F::from_canonical_u32(2), F::from_canonical_u32(2), F::from_canonical_u32(2), F::from_canonical_u32(4),
-        F::ZERO,                  F::from_canonical_u32(2), F::from_canonical_u32(4), F::from_canonical_u32(4),
-    ];
-
-    let after_board: Vec<F> = vec![
-        F::ZERO, F::from_canonical_u32(4), F::from_canonical_u32(4), F::from_canonical_u32(8),
-        F::ZERO, F::ZERO,                  F::from_canonical_u32(2), F::from_canonical_u32(8),
         F::ZERO, F::from_canonical_u32(2), F::from_canonical_u32(4), F::from_canonical_u32(4),
-        F::ZERO, F::ZERO,                  F::from_canonical_u32(2), F::from_canonical_u32(8),
     ];
 
-    // Direction: "right" (3)
-    let direction = F::from_canonical_u32(3);
+    // Example board state after move right
+    let after_board = vec![
+        F::ZERO, F::from_canonical_u32(4), F::from_canonical_u32(4), F::from_canonical_u32(8),
+        F::ZERO, F::ZERO, F::from_canonical_u32(4), F::from_canonical_u32(8),
+        F::ZERO, F::from_canonical_u32(2), F::from_canonical_u32(4), F::from_canonical_u32(4),
+        F::ZERO, F::from_canonical_u32(2), F::from_canonical_u32(4), F::from_canonical_u32(4),
+    ];
 
-    // Build the circuit
-    let (circuit_builder, targets) = Game2048Circuit::build_circuit();
-
-    // Unpack targets
-    let (before_targets, after_targets, direction_target) =
-        (&targets[0..16], &targets[16..32], targets[32]);
-
-    // Set the witness values
-    let mut pw = PartialWitness::<F>::new();
-    
-    // Set before board values
-    for (i, &target) in before_targets.iter().enumerate() {
-        pw.set_target(target, before_board[i])?;
-    }
-    
-    // Set after board values
-    for (i, &target) in after_targets.iter().enumerate() {
-        pw.set_target(target, after_board[i])?;
-    }
-    
-    // Set direction
-    pw.set_target(direction_target, direction)?;
-
-    // Build and generate the proof
-    let circuit = circuit_builder.build::<PoseidonGoldilocksConfig>();
-    let proof = circuit.prove(pw)?;
-
-    // Verify the proof
-    circuit.verify(proof)?;
-    println!("Proof verified successfully!");
+    // Prove the move
+    circuit.prove_move(before_board, after_board, Direction::Right)?;
 
     Ok(())
 }
@@ -393,75 +358,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_recursive_game2048_multiple_states() -> anyhow::Result<()> {
-        // Build the base circuit
-        let (base_builder, base_targets) = Game2048Circuit::build_circuit();
-        let base_circuit = base_builder.build::<C>();
+    fn test_valid_move() -> Result<()> {
+        let circuit = Game2048Circuit::new(4);
 
-        // Initial board
-        let before_board1: Vec<F> = vec![
-            F::from_canonical_u32(2), F::from_canonical_u32(2), F::ZERO,                    F::from_canonical_u32(4),
-            F::ZERO,                  F::ZERO,                  F::from_canonical_u32(4),   F::ZERO,
-            F::from_canonical_u32(2), F::ZERO,                  F::ZERO,                    F::from_canonical_u32(2),
-            F::ZERO,                  F::from_canonical_u32(4), F::ZERO,                    F::ZERO,
+        let before_board = vec![
+            F::from_canonical_u32(2), F::from_canonical_u32(2), F::ZERO, F::ZERO,
+            F::ZERO, F::from_canonical_u32(4), F::ZERO, F::ZERO,
+            F::ZERO, F::ZERO, F::from_canonical_u32(4), F::ZERO,
+            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(2),
         ];
 
-        let after_board1: Vec<F> = vec![
-            F::from_canonical_u32(4),   F::from_canonical_u32(2),   F::from_canonical_u32(4),   F::from_canonical_u32(4),
-            F::ZERO,                    F::from_canonical_u32(4),   F::ZERO,                    F::from_canonical_u32(2),
-            F::ZERO,                    F::ZERO,                    F::ZERO,                    F::ZERO,
-            F::ZERO,                    F::ZERO,                    F::ZERO,                    F::ZERO,
+        let after_board = vec![
+            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(4),
+            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(4),
+            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(4),
+            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(2),
         ];
-        let direction1 = F::from_canonical_u32(0); // "up"
 
-        // Prove the first move
-        let mut pw1 = PartialWitness::<F>::new();
-        let before_board_targets1 = &base_targets[0..16];
-        let after_board_targets1 = &base_targets[16..32];
-        let direction_target1 = base_targets[32];
-        for (i, &target) in before_board_targets1.iter().enumerate() {
-            pw1.set_target(target, before_board1[i])?;
-        }
-        for (i, &target) in after_board_targets1.iter().enumerate() {
-            pw1.set_target(target, after_board1[i])?;
-        }
-        pw1.set_target(direction_target1, direction1)?;
-        let proof1 = base_circuit.prove(pw1)?;
-        base_circuit.verify(proof1.clone())?;
-        println!("Base proof verified!");
-
-        // Prepare second move (recursive)
-        let before_board2: Vec<F> = after_board1.clone();
-        let after_board2: Vec<F> = vec![
-            F::from_canonical_u32(4),   F::ZERO,   F::from_canonical_u32(4),   F::from_canonical_u32(4),
-            F::from_canonical_u32(2),   F::from_canonical_u32(4),   F::ZERO,                    F::from_canonical_u32(2),
-            F::ZERO,                    F::ZERO,                    F::ZERO,                    F::ZERO,
-            F::ZERO,                    F::ZERO,                    F::ZERO,                    F::ZERO,
-        ];
-        let direction2 = F::from_canonical_u32(3); // "right"
-
-        // Build and prove recursive circuit #1
-        let recursive_circuit1 = RecursiveGame2048Circuit::build_recursive_circuit();
-        let proof2 = recursive_circuit1.prove(vec![(before_board2, after_board2, direction2)]).unwrap();
-        recursive_circuit1.verify(proof2.clone())?;
-        println!("First recursive proof verified!");
-
-        // Third move (second recursion)
-        let before_board3: Vec<F> = after_board2.clone();
-        let after_board3: Vec<F> = vec![
-            F::from_canonical_u32(4),   F::from_canonical_u32(4),   F::from_canonical_u32(4),   F::ZERO,
-            F::from_canonical_u32(2),   F::from_canonical_u32(4),   F::from_canonical_u32(2),   F::ZERO,
-            F::ZERO,                    F::ZERO,                    F::ZERO,                    F::ZERO,
-            F::ZERO,                    F::ZERO,                    F::ZERO,                    F::ZERO,
-        ];
-        let direction3 = F::from_canonical_u32(2); // "left"
-
-        // Build and prove recursive circuit #2
-        let recursive_circuit2 = RecursiveGame2048Circuit::build_recursive_circuit();
-        let proof3 = recursive_circuit2.prove(vec![(before_board3, after_board3, direction3)]).unwrap();
-        recursive_circuit2.verify(proof3)?;
-        println!("Second recursive proof verified!");
-
-        Ok(())
+        circuit.prove_move(before_board, after_board, Direction::Right)
     }
 }
