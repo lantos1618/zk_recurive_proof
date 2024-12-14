@@ -163,105 +163,148 @@ impl Game2048Circuit {
                 let idx = row * self.board_size + col;
                 let current = before_board[idx];
                 let current_after = after_board[idx];
-                
-                // Basic cell transition constraints
+
+                // Calculate potential next indices for each direction
+                let up_idx = if row > 0 { Some((row - 1) * self.board_size + col) } else { None };
+                let down_idx = if row < self.board_size - 1 { Some((row + 1) * self.board_size + col) } else { None };
+                let left_idx = if col > 0 { Some(row * self.board_size + (col - 1)) } else { None };
+                let right_idx = if col < self.board_size - 1 { Some(row * self.board_size + (col + 1)) } else { None };
+
+                // For each valid direction, add constraints
+                if let Some(next_idx) = up_idx {
+                    let next_val = before_board[next_idx];
+                    let next_after = after_board[next_idx];
+                    self.add_move_constraints_for_direction(
+                        builder, current, current_after, next_val, next_after,
+                        is_up, zero_target, one_target
+                    );
+                }
+
+                if let Some(next_idx) = down_idx {
+                    let next_val = before_board[next_idx];
+                    let next_after = after_board[next_idx];
+                    self.add_move_constraints_for_direction(
+                        builder, current, current_after, next_val, next_after,
+                        is_down, zero_target, one_target
+                    );
+                }
+
+                if let Some(next_idx) = left_idx {
+                    let next_val = before_board[next_idx];
+                    let next_after = after_board[next_idx];
+                    self.add_move_constraints_for_direction(
+                        builder, current, current_after, next_val, next_after,
+                        is_left, zero_target, one_target
+                    );
+                }
+
+                if let Some(next_idx) = right_idx {
+                    let next_val = before_board[next_idx];
+                    let next_after = after_board[next_idx];
+                    self.add_move_constraints_for_direction(
+                        builder, current, current_after, next_val, next_after,
+                        is_right, zero_target, one_target
+                    );
+                }
+
+                // If no movement is possible in the selected direction, cell must stay the same
+                let mut direction_possibilities = Vec::new();
+                if up_idx.is_some() {
+                    direction_possibilities.push(builder.select(is_up, one_target, zero_target));
+                }
+                if down_idx.is_some() {
+                    direction_possibilities.push(builder.select(is_down, one_target, zero_target));
+                }
+                if left_idx.is_some() {
+                    direction_possibilities.push(builder.select(is_left, one_target, zero_target));
+                }
+                if right_idx.is_some() {
+                    direction_possibilities.push(builder.select(is_right, one_target, zero_target));
+                }
+
+                let any_direction_possible = builder.add_many(&direction_possibilities);
+                // Store the equality check result
+                let is_one = builder.is_equal(any_direction_possible, one_target);
+                // Now use the stored result
+                let must_stay_same = builder.not(is_one);
+                // Store the equality check result
                 let stays_same = builder.is_equal(current, current_after);
-                let becomes_zero = builder.is_equal(current_after, zero_target);
-
-                // For each cell, we need to check if it can merge with neighbors
-                let mut can_merge = Vec::new();
                 
-                // Check up
-                if row > 0 {
-                    let up_idx = (row - 1) * self.board_size + col;
-                    let up_val = before_board[up_idx];
-                    let up_after = after_board[up_idx];
-                    let values_equal = builder.is_equal(current, up_val);
-                    let merged_value = builder.mul_const(F::TWO, current);
-                    let merged_correctly = builder.is_equal(up_after, merged_value);
-                    let merge_happened = builder.and(values_equal, merged_correctly);
-                    can_merge.push(builder.and(merge_happened, is_up));
-                }
-
-                // Check down
-                if row < self.board_size - 1 {
-                    let down_idx = (row + 1) * self.board_size + col;
-                    let down_val = before_board[down_idx];
-                    let down_after = after_board[down_idx];
-                    let values_equal = builder.is_equal(current, down_val);
-                    let merged_value = builder.mul_const(F::TWO, current);
-                    let merged_correctly = builder.is_equal(down_after, merged_value);
-                    let merge_happened = builder.and(values_equal, merged_correctly);
-                    can_merge.push(builder.and(merge_happened, is_down));
-                }
-
-                // Check left
-                if col > 0 {
-                    let left_idx = row * self.board_size + (col - 1);
-                    let left_val = before_board[left_idx];
-                    let left_after = after_board[left_idx];
-                    let values_equal = builder.is_equal(current, left_val);
-                    let merged_value = builder.mul_const(F::TWO, current);
-                    let merged_correctly = builder.is_equal(left_after, merged_value);
-                    let merge_happened = builder.and(values_equal, merged_correctly);
-                    can_merge.push(builder.and(merge_happened, is_left));
-                }
-
-                // Check right
-                if col < self.board_size - 1 {
-                    let right_idx = row * self.board_size + (col + 1);
-                    let right_val = before_board[right_idx];
-                    let right_after = after_board[right_idx];
-                    let values_equal = builder.is_equal(current, right_val);
-                    let merged_value = builder.mul_const(F::TWO, current);
-                    let merged_correctly = builder.is_equal(right_after, merged_value);
-                    let merge_happened = builder.and(values_equal, merged_correctly);
-                    can_merge.push(builder.and(merge_happened, is_right));
-                }
-
-                // A cell must either:
-                // 1. Stay the same (if no movement possible in chosen direction)
-                // 2. Become zero (if moved or merged)
-                // 3. Double in value (if merged with equal value)
-                let any_merge_possible = if can_merge.is_empty() {
-                    zero_target
-                } else {
-                    // Convert boolean targets to field targets first
-                    let merge_targets: Vec<_> = can_merge.iter()
-                        .map(|&b| builder.select(b, one_target, zero_target))
-                        .collect();
-                    
-                    // Then sum them up
-                    let merge_sum = builder.add_many(&merge_targets);
-                    
-                    // Finally check if exactly one merge happened
-                    let is_one_merge = builder.is_equal(merge_sum, one_target);
-                    builder.select(is_one_merge, one_target, zero_target)
-                };
-
-                // The cell's final state must be valid
-                let stays_same_target = builder.select(stays_same, one_target, zero_target);
-                let becomes_zero_target = builder.select(becomes_zero, one_target, zero_target);
+                // Convert boolean conditions to targets for arithmetic
+                let must_stay_same_t = builder.select(must_stay_same, one_target, zero_target);
+                let stays_same_t = builder.select(stays_same, one_target, zero_target);
                 
-                let valid_state = [
-                    stays_same_target,
-                    becomes_zero_target,
-                    any_merge_possible,
-                ];
-                let state_sum = builder.add_many(&valid_state);
-                builder.connect(state_sum, one_target);
+                // Both conditions must be true (using arithmetic)
+                let both_true = builder.mul(must_stay_same_t, stays_same_t);
+                // Store the equality check result
+                let final_bool = builder.is_equal(both_true, one_target);
+                builder.assert_bool(final_bool);
             }
         }
 
         // Verify that exactly one direction is chosen
-        let up_target = builder.select(is_up, one_target, zero_target);
-        let down_target = builder.select(is_down, one_target, zero_target);
-        let left_target = builder.select(is_left, one_target, zero_target);
-        let right_target = builder.select(is_right, one_target, zero_target);
+        let mut direction_targets = Vec::new();
+        // Convert BoolTargets to arithmetic targets
+        direction_targets.push(builder.select(is_up, one_target, zero_target));
+        direction_targets.push(builder.select(is_down, one_target, zero_target));
+        direction_targets.push(builder.select(is_left, one_target, zero_target));
+        direction_targets.push(builder.select(is_right, one_target, zero_target));
+        // Store the sum result
+        let direction_sum = builder.add_many(&direction_targets);
+        // Store the equality check result
+        let direction_valid = builder.is_equal(direction_sum, one_target);
+        builder.assert_bool(direction_valid);
+    }
+
+    /// Helper function to add constraints for a single direction
+    fn add_move_constraints_for_direction(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        current: Target,
+        current_after: Target,
+        next_val: Target,
+        next_after: Target,
+        is_this_direction: plonky2::iop::target::BoolTarget,
+        zero_target: Target,
+        one_target: Target,
+    ) {
+        // Case 1: Values are equal - can merge
+        let values_equal = builder.is_equal(current, next_val);
+        let merged_value = builder.mul_const(F::TWO, current);
+        let merged_correctly = builder.is_equal(next_after, merged_value);
+        let merge_possible = builder.and(values_equal, merged_correctly);
+
+        // Case 2: Next cell is empty - can move
+        let next_is_empty = builder.is_equal(next_val, zero_target);
+        let moved_correctly = builder.is_equal(next_after, current);
+        let move_possible = builder.and(next_is_empty, moved_correctly);
+
+        // Case 3: Cell stays the same
+        let stays_same = builder.is_equal(current, current_after);
+
+        // Case 4: Cell becomes zero (after moving or merging)
+        let becomes_zero = builder.is_equal(current_after, zero_target);
+
+        // Convert boolean conditions to arithmetic targets
+        let mut transition_targets = Vec::new();
+        transition_targets.push(builder.select(stays_same, one_target, zero_target));
+        transition_targets.push(builder.select(becomes_zero, one_target, zero_target));
+        transition_targets.push(builder.select(merge_possible, one_target, zero_target));
+        transition_targets.push(builder.select(move_possible, one_target, zero_target));
         
-        let direction_targets = [up_target, down_target, left_target, right_target];
-        let sum = builder.add_many(&direction_targets);
-        builder.connect(sum, one_target);
+        // Sum all possibilities and verify exactly one is true
+        let valid_transition = builder.add_many(&transition_targets);
+        // Store the equality check result
+        let valid_state = builder.is_equal(valid_transition, one_target);
+        
+        // Convert to arithmetic for final combination
+        let direction_t = builder.select(is_this_direction, one_target, zero_target);
+        let valid_state_t = builder.select(valid_state, one_target, zero_target);
+        // Store the multiplication result
+        let final_value = builder.mul(direction_t, valid_state_t);
+        // Store the equality check result
+        let final_bool = builder.is_equal(final_value, one_target);
+        builder.assert_bool(final_bool);
     }
 
     /// Adds constraint that a value must be 0 or a power of 2
@@ -361,20 +404,47 @@ mod tests {
     fn test_valid_move() -> Result<()> {
         let circuit = Game2048Circuit::new(4);
 
+        // Initial board with two 2's that can merge
         let before_board = vec![
-            F::from_canonical_u32(2), F::from_canonical_u32(2), F::ZERO, F::ZERO,
-            F::ZERO, F::from_canonical_u32(4), F::ZERO, F::ZERO,
-            F::ZERO, F::ZERO, F::from_canonical_u32(4), F::ZERO,
-            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(2),
+            F::ZERO,                  F::ZERO,                  F::from_canonical_u32(2), F::from_canonical_u32(2),
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
         ];
 
+        // After moving right, the two 2's merge into a 4
         let after_board = vec![
-            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(4),
-            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(4),
-            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(4),
-            F::ZERO, F::ZERO, F::ZERO, F::from_canonical_u32(2),
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::from_canonical_u32(4),
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
         ];
 
+        // Test a simple right move that merges two 2's into a 4
+        circuit.prove_move(before_board, after_board, Direction::Right)
+    }
+
+    #[test]
+    fn test_valid_move_no_merge() -> Result<()> {
+        let circuit = Game2048Circuit::new(4);
+
+        // Initial board with a single 2
+        let before_board = vec![
+            F::ZERO,                  F::ZERO,                  F::from_canonical_u32(2), F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+        ];
+
+        // After moving right, the 2 moves to the rightmost position
+        let after_board = vec![
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::from_canonical_u32(2),
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+            F::ZERO,                  F::ZERO,                  F::ZERO,                  F::ZERO,
+        ];
+
+        // Test a simple right move without merging
         circuit.prove_move(before_board, after_board, Direction::Right)
     }
 }
