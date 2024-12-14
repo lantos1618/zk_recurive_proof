@@ -91,55 +91,31 @@ struct RecursiveGame2048Circuit {
     before_board_targets: Vec<Target>,
     after_board_targets: Vec<Target>,
     direction_target: Target,
+    num_moves_target: Target, // Track number of moves in the recursion
 }
 
 impl RecursiveGame2048Circuit {
-    pub fn build_recursive_circuit(
-        previous_circuit: Option<&CircuitData<F, C, D>>,
-    ) -> Self {
+    pub fn build_recursive_circuit() -> Self {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config.clone());
 
-        // Add previous proof target if any
-        let recursive_proof_target = if let Some(prev_circuit) = previous_circuit {
-            let proof_target = builder.add_virtual_proof_with_pis(&prev_circuit.common);
-            let verifier_data = builder.add_virtual_verifier_data(prev_circuit.common.config.fri_config.cap_height);
-            
-            // Add generator for verifier data
-            builder.add_simple_generator(VerifierDataGenerator {
-                verifier_data_target: verifier_data.clone(),
-                verifier_data: prev_circuit.verifier_only.clone(),
-            });
-
-            // Verify previous proof
-            builder.verify_proof::<C>(&proof_target, &verifier_data, &prev_circuit.common);
-            
-            proof_target
-        } else {
-            // Create a base circuit for the base case
-            let (base_builder, _) = Game2048Circuit::build_circuit();
-            let base_data = base_builder.build::<C>();
-            let proof_target = builder.add_virtual_proof_with_pis(&base_data.common);
-            let verifier_data = builder.add_virtual_verifier_data(base_data.common.config.fri_config.cap_height);
-            
-            // Add generator for verifier data
-            builder.add_simple_generator(VerifierDataGenerator {
-                verifier_data_target: verifier_data.clone(),
-                verifier_data: base_data.verifier_only,
-            });
-
-            // Verify base proof
-            builder.verify_proof::<C>(&proof_target, &verifier_data, &base_data.common);
-            
-            proof_target
-        };
+        // Add recursive proof target that points to the same circuit type
+        let recursive_proof_target = builder.add_virtual_proof_with_pis(&builder.common_data());
+        let verifier_data = builder.add_virtual_verifier_data(builder.common_data().config.fri_config.cap_height);
+        
+        // Add generator for verifier data
+        builder.add_simple_generator(VerifierDataGenerator {
+            verifier_data_target: verifier_data.clone(),
+            verifier_data: builder.common_data().verifier_only.clone(),
+        });
 
         // Current move inputs
         let before_board_targets: Vec<_> = (0..16).map(|_| builder.add_virtual_target()).collect();
         let after_board_targets: Vec<_> = (0..16).map(|_| builder.add_virtual_target()).collect();
         let direction_target = builder.add_virtual_target();
+        let num_moves_target = builder.add_virtual_target();
 
-        // Register as public inputs
+        // Register all public inputs
         for &t in &before_board_targets {
             builder.register_public_input(t);
         }
@@ -147,6 +123,20 @@ impl RecursiveGame2048Circuit {
             builder.register_public_input(t);
         }
         builder.register_public_input(direction_target);
+        builder.register_public_input(num_moves_target);
+
+        // Verify previous proof only if num_moves > 0
+        let zero = builder.zero();
+        let is_base_case = builder.is_equal(num_moves_target, zero);
+        let not_base_case = builder.not(is_base_case);
+        
+        // Conditionally verify the recursive proof
+        builder.verify_proof_with_bool::<C>(
+            &recursive_proof_target,
+            &verifier_data,
+            &builder.common_data(),
+            not_base_case
+        );
 
         // Add constraints for current move
         Game2048Circuit::add_constraints(
@@ -156,13 +146,12 @@ impl RecursiveGame2048Circuit {
             direction_target,
         );
 
-        // Connect the after_board of previous proof to before_board of current proof
-        if let Some(_) = previous_circuit {
-            for (prev_after, curr_before) in recursive_proof_target.public_inputs[16..32]
-                .iter()
-                .zip(before_board_targets.iter()) {
-                builder.connect(*prev_after, *curr_before);
-            }
+        // Connect the after_board of previous proof to before_board of current proof when not in base case
+        for (prev_after, curr_before) in recursive_proof_target.public_inputs[16..32]
+            .iter()
+            .zip(before_board_targets.iter()) {
+            let connected = builder.select(not_base_case, *prev_after, *curr_before);
+            builder.connect(*curr_before, connected);
         }
 
         builder.print_gate_counts(0);
@@ -174,47 +163,60 @@ impl RecursiveGame2048Circuit {
             before_board_targets,
             after_board_targets,
             direction_target,
+            num_moves_target,
         }
     }
 
     pub fn prove(
         &self,
-        previous_proof: Option<ProofWithPublicInputs<F, C, D>>,
-        before_board: Vec<F>,
-        after_board: Vec<F>,
-        direction: F,
+        moves: Vec<(Vec<F>, Vec<F>, F)>, // List of (before_board, after_board, direction)
     ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-        // Validate input sizes
-        if before_board.len() != 16 {
-            anyhow::bail!("Before board must have exactly 16 elements");
-        }
-        if after_board.len() != 16 {
-            anyhow::bail!("After board must have exactly 16 elements");
-        }
-        
-        // Validate direction
-        let dir_val = direction.to_canonical_u64();
-        if dir_val > 3 {
-            anyhow::bail!("Direction must be 0 (up), 1 (down), 2 (left), or 3 (right)");
+        if moves.is_empty() {
+            anyhow::bail!("No moves provided");
         }
 
-        let mut pw = PartialWitness::<F>::new();
+        let mut current_proof = None;
+        let mut num_moves = moves.len();
 
-        // Set previous proof witness if any
-        if let Some(proof) = previous_proof {
-            pw.set_proof_with_pis_target(&self.recursive_proof_target, &proof)?;
+        // Process moves in reverse order to build up the recursive proofs
+        for (before_board, after_board, direction) in moves.iter().rev() {
+            // Validate input sizes
+            if before_board.len() != 16 {
+                anyhow::bail!("Before board must have exactly 16 elements");
+            }
+            if after_board.len() != 16 {
+                anyhow::bail!("After board must have exactly 16 elements");
+            }
+            
+            // Validate direction
+            let dir_val = direction.to_canonical_u64();
+            if dir_val > 3 {
+                anyhow::bail!("Direction must be 0 (up), 1 (down), 2 (left), or 3 (right)");
+            }
+
+            let mut pw = PartialWitness::<F>::new();
+
+            // Set previous proof witness if any
+            if let Some(proof) = current_proof {
+                pw.set_proof_with_pis_target(&self.recursive_proof_target, &proof)?;
+            }
+
+            // Set current move
+            for (i, &target) in self.before_board_targets.iter().enumerate() {
+                pw.set_target(target, before_board[i])?;
+            }
+            for (i, &target) in self.after_board_targets.iter().enumerate() {
+                pw.set_target(target, after_board[i])?;
+            }
+            pw.set_target(self.direction_target, *direction)?;
+            pw.set_target(self.num_moves_target, F::from_canonical_u64(num_moves as u64))?;
+
+            // Generate proof for this step
+            current_proof = Some(self.circuit.prove(pw)?);
+            num_moves -= 1;
         }
 
-        // Set current move
-        for (i, &target) in self.before_board_targets.iter().enumerate() {
-            pw.set_target(target, before_board[i])?;
-        }
-        for (i, &target) in self.after_board_targets.iter().enumerate() {
-            pw.set_target(target, after_board[i])?;
-        }
-        pw.set_target(self.direction_target, direction)?;
-
-        self.circuit.prove(pw)
+        current_proof.ok_or_else(|| anyhow::anyhow!("Failed to generate proof"))
     }
 
     pub fn verify(
@@ -222,7 +224,7 @@ impl RecursiveGame2048Circuit {
         proof: ProofWithPublicInputs<F, C, D>,
     ) -> anyhow::Result<()> {
         // Validate public inputs length
-        let expected_inputs = 33; // 16 before + 16 after + 1 direction
+        let expected_inputs = 34; // 16 before + 16 after + 1 direction + 1 num_moves
         if proof.public_inputs.len() != expected_inputs {
             anyhow::bail!(
                 "Invalid number of public inputs. Expected {}, got {}",
@@ -235,6 +237,12 @@ impl RecursiveGame2048Circuit {
         let direction = proof.public_inputs[32].to_canonical_u64();
         if direction > 3 {
             anyhow::bail!("Invalid direction value in proof: {}", direction);
+        }
+
+        // Validate num_moves value
+        let num_moves = proof.public_inputs[33].to_canonical_u64();
+        if num_moves == 0 {
+            anyhow::bail!("Invalid number of moves: {}", num_moves);
         }
 
         // First verify the proof itself
@@ -433,8 +441,8 @@ mod tests {
         let direction2 = F::from_canonical_u32(3); // "right"
 
         // Build and prove recursive circuit #1
-        let recursive_circuit1 = RecursiveGame2048Circuit::build_recursive_circuit(Some(&base_circuit));
-        let proof2 = recursive_circuit1.prove(Some(proof1), before_board2, after_board2.clone(), direction2)?;
+        let recursive_circuit1 = RecursiveGame2048Circuit::build_recursive_circuit();
+        let proof2 = recursive_circuit1.prove(vec![(before_board2, after_board2, direction2)]).unwrap();
         recursive_circuit1.verify(proof2.clone())?;
         println!("First recursive proof verified!");
 
@@ -449,8 +457,8 @@ mod tests {
         let direction3 = F::from_canonical_u32(2); // "left"
 
         // Build and prove recursive circuit #2
-        let recursive_circuit2 = RecursiveGame2048Circuit::build_recursive_circuit(Some(&recursive_circuit1.circuit));
-        let proof3 = recursive_circuit2.prove(Some(proof2), before_board3, after_board3, direction3)?;
+        let recursive_circuit2 = RecursiveGame2048Circuit::build_recursive_circuit();
+        let proof3 = recursive_circuit2.prove(vec![(before_board3, after_board3, direction3)]).unwrap();
         recursive_circuit2.verify(proof3)?;
         println!("Second recursive proof verified!");
 
